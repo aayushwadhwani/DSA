@@ -38,10 +38,16 @@ jobs:
 
           # List changed files, take the first path segment (top-level folder),
           # drop files sitting at repo root, dedupe.
+          # `|| true` at the end matters: if grep -v filters out every line
+          # (e.g. this push only touched files under .github/), grep exits 1,
+          # and under `set -euo pipefail` that would kill the script right
+          # here — before we even reach the "no folders changed" handling
+          # below. `|| true` lets that case fall through as an empty $FOLDERS
+          # instead of aborting the job.
           FOLDERS=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
             | grep -v '^\.github/' \
             | awk -F/ 'NF>1 {print $1}' \
-            | sort -u)
+            | sort -u || true)
 
           if [ -z "$FOLDERS" ]; then
             echo "folders=[]" >> "$GITHUB_OUTPUT"
