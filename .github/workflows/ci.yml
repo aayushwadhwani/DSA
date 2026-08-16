@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  pull_request:      # no `branches:` filter → runs for a PR targeting ANY branch
+  push:               # no `branches:` filter → runs for a push to ANY branch
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      folders: ${{ steps.set-folders.outputs.folders }}
+      has_changes: ${{ steps.set-folders.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to diff against base branch
+
+      - name: Determine changed top-level folders
+        id: set-folders
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.sha }}"
+          fi
+
+          # Fallback for first push to a new branch (before = all zeros)
+          if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ] || [ -z "$BASE_SHA" ]; then
+            BASE_SHA=$(git rev-list --max-parents=0 HEAD)
+          fi
+
+          echo "Diffing $BASE_SHA..$HEAD_SHA"
+
+          # List changed files, take the first path segment (top-level folder),
+          # drop files sitting at repo root, dedupe.
+          FOLDERS=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
+            | grep -v '^\.github/' \
+            | awk -F/ 'NF>1 {print $1}' \
+            | sort -u)
+
+          if [ -z "$FOLDERS" ]; then
+            echo "folders=[]" >> "$GITHUB_OUTPUT"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          JSON=$(printf '%s\n' "$FOLDERS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "folders=$JSON" >> "$GITHUB_OUTPUT"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "Changed folders: $JSON"
+
+  build-and-test:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        folder: ${{ fromJson(needs.detect-changes.outputs.folders) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Skip if folder no longer exists (e.g. was deleted/renamed)
+        id: check
+        run: |
+          if [ -d "${{ matrix.folder }}" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compile ${{ matrix.folder }}
+        if: steps.check.outputs.exists == 'true'
+        working-directory: ${{ matrix.folder }}
+        run: |
+          mkdir -p out
+          find . -name '*.java' > sources.txt
+          if [ -s sources.txt ]; then
+            javac -d out @sources.txt
+          else
+            echo "No .java files found in ${{ matrix.folder }}, skipping compile."
+          fi
+
+      - name: Run tests (Main is never executed)
+        if: steps.check.outputs.exists == 'true'
+        working-directory: ${{ matrix.folder }}
+        run: |
+          set -uo pipefail
+
+          # No package declarations in these files, so javac -d out flattens
+          # everything (Main.class, TribonacciMemo.class, *Test.class) into out/.
+          # We only run classes whose name ends in "Test" — Main.class is
+          # intentionally excluded by this naming filter.
+          TEST_CLASSES=$(find out -maxdepth 1 -name '*Test.class' 2>/dev/null \
+            | sed 's|^out/||; s|\.class$||')
+
+          if [ -z "$TEST_CLASSES" ]; then
+            echo "No test classes found under ${{ matrix.folder }}/test — nothing to run."
+            exit 0
+          fi
+
+          FAILED=0
+          for CLASS in $TEST_CLASSES; do
+            echo "::group::Running $CLASS"
+            if ! java -cp out "$CLASS"; then
+              FAILED=1
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo "One or more test classes failed."
+            exit 1
+          fi
