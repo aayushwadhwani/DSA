@@ -7,7 +7,7 @@ public class TribonacciTabularTest {
     private static int failed = 0;
 
     public static void main(String[] args) {
-        TribonacciTabular solver = new TribonacciTabular() 
+        TribonacciTabular solver = new TribonacciTabular();
 
         // Known Tribonacci sequence: T0=0, T1=1, T2=1, Tn = Tn-1+Tn-2+Tn-3
         assertEquals("T(0)", 0, solver.Tribonacci(0));
